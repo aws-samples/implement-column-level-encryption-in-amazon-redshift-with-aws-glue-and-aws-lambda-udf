@@ -1,0 +1,397 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Sample solution to implement column-level encryption in Amazon Redshift with AWS Glue and AWS Lambda UDF'
+
+Parameters:
+  RedshiftMasterUsername:
+    Type: String
+    Description: Enter a username for the admin user account of the Redshift cluster.
+    Default: 'master'
+    AllowedPattern: '([a-z])([a-z]|[0-9])*'
+  RedshiftMasterUserPassword:
+    Type: String
+    Description: Enter a password for the admin user account of the Redshift cluster.
+    ConstraintDescription: Must be between 8 and 64 characters in length, contain at least one uppercase letter, at least one lowercase letter, and at least one number.
+    MinLength: 8
+    MaxLength: 64
+    NoEcho: true
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: 10.0.0.0/16
+    PublicSubnet:
+      CIDR: 10.0.0.0/24
+    PrivateSubnet:
+      CIDR: 10.0.1.0/24
+
+Resources:
+  # VPC for Redshift
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap 
+        - SubnetConfig
+        - VPC
+        - CIDR
+
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap 
+        - SubnetConfig
+        - PublicSubnet
+        - CIDR
+      MapPublicIpOnLaunch: false
+      
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+
+  GatewayAttachement:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachement
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt 
+        - NATGatewayEIP
+        - AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PrivateSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap 
+        - SubnetConfig
+        - PrivateSubnet
+        - CIDR
+ 
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+
+  NATRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable Glue access to Redshift
+      VpcId:
+        Ref: VPC
+  
+  SecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      Description: Self-referencing rule for AWS Glue
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  SecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      Description: Allow ALL outbound traffic
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+
+  # Redshift cluster
+  RedshiftCluster: 
+    Type: 'AWS::Redshift::Cluster'
+    Properties:
+      DBName: 'demodb'
+      MasterUsername:
+        Ref: 'RedshiftMasterUsername'
+      MasterUserPassword: 
+        Ref: 'RedshiftMasterUserPassword'
+      NodeType: 'dc2.large'
+      ClusterType: 'single-node'
+      PubliclyAccessible: false
+      Encrypted: true
+      IamRoles: 
+      - !GetAtt 'RoleRedshiftLambdaUDF.Arn'
+      ClusterParameterGroupName:
+        Ref: RedshiftClusterParameterGroup
+      VpcSecurityGroupIds:
+      - Ref: SecurityGroup
+      ClusterSubnetGroupName:
+        Ref: RedshiftClusterSubnetGroup
+
+  RedshiftClusterParameterGroup:
+    Type: AWS::Redshift::ClusterParameterGroup
+    Properties:
+      Description: Cluster parameter group
+      ParameterGroupFamily: redshift-1.0
+      Parameters:
+      - ParameterName: enable_user_activity_logging
+        ParameterValue: 'true'
+      - ParameterName: require_ssl
+        ParameterValue: 'true'
+
+  RedshiftClusterSubnetGroup:
+    Type: AWS::Redshift::ClusterSubnetGroup
+    Properties:
+      Description: Cluster subnet group
+      SubnetIds:
+      - Ref: PrivateSubnet
+
+  # S3 bucket
+  BucketDataUpload:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        !Sub
+          - 'awsblog-pii-data-input-${RandomGUID}'
+          - {RandomGUID: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Cloud9 IDE
+  Cloud9Instance:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties: 
+      ImageId: 'amazonlinux-2-x86_64'
+      InstanceType: 't3.small'
+
+  # Lambda function
+  LambdaDecryptUDF:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt 'RoleLambdaDecryptUDF.Arn'
+      Code:
+        S3Bucket: !Sub aws-blog-redshift-${AWS::Region}
+        S3Key: my-deployment-package.zip
+      Environment:
+        Variables:
+          DATA_ENCRYPT_KEY: 'data-encryption-key'
+      Runtime: 'python3.7'
+      Timeout: 30
+
+  # Glue Catalog database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: 'demodb'
+        Description: 'Demo Glue database'
+  
+  # Glue Crawler
+  GlueS3Crawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: 'glue-s3-crawler'
+      Role: !GetAtt RoleGlueCrawlerGlueJob.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Ref BucketDataUpload
+
+  GlueRedshiftCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: 'glue-redshift-crawler'
+      Role: !GetAtt RoleGlueCrawlerGlueJob.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueRedshiftConnection
+            Path: 'demodb/public/%'
+
+  # Glue Connection for Redshift
+  GlueRedshiftConnection:
+    Type: 'AWS::Glue::Connection'
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: redshift-connection
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !Select 
+          - 0
+          - !GetAZs 
+            Ref: 'AWS::Region'
+          SecurityGroupIdList:
+          - Ref: SecurityGroup
+          SubnetId: !Ref PrivateSubnet
+        ConnectionType: 'JDBC'
+        ConnectionProperties:
+          'JDBC_CONNECTION_URL': !Sub jdbc:redshift://${RedshiftCluster.Endpoint.Address}:${RedshiftCluster.Endpoint.Port}/demodb
+          'USERNAME': !Ref RedshiftMasterUsername
+          'PASSWORD': !Ref RedshiftMasterUserPassword
+
+  # Glue Job
+  GlueJobDataEncryption:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${BucketDataUpload}/glue-script/pii-data-encryption.py
+      DefaultArguments:
+        {
+          '--additional-python-modules': 'miscreant',
+          '--job-bookmark-option': 'job-bookmark-disable',
+          '--TempDir': !Sub 's3://${BucketDataUpload}/redshift-temp/',
+          '--InputTable': !Join ['_', !Split ['-', !Sub '${BucketDataUpload}']],
+          '--SecretName': 'data-encryption-key'
+        }
+      GlueVersion: '3.0'
+      WorkerType: 'G.1X'
+      NumberOfWorkers: 2
+      MaxRetries: 0
+      Timeout: 10
+      Name: pii-data-encryption-job
+      Role: !GetAtt 'RoleGlueCrawlerGlueJob.Arn'
+      Connections:
+        Connections: 
+        - Ref: GlueRedshiftConnection
+
+  # IAM roles - this role is given all permissions for demonstration purpose only
+  RoleGlueCrawlerGlueJob:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'glue.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        -
+          PolicyName: 'root'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: 'Allow'
+                Action: '*'
+                Resource: '*'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess'
+
+  RoleRedshiftLambdaUDF:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'redshift.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaRole'
+
+  RoleLambdaDecryptUDF:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: AllowSecretsManagerReadAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'secretsmanager:GetResourcePolicy'
+            - 'secretsmanager:GetSecretValue'
+            - 'secretsmanager:DescribeSecret'
+            - 'secretsmanager:ListSecretVersionIds'
+            - 'secretsmanager:ListSecrets'
+            Resource:
+            - '*'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+Outputs:
+  AmazonS3BucketForDataUpload:
+    Value: !Sub https://s3.console.aws.amazon.com/s3/buckets/${BucketDataUpload}?region=${AWS::Region}
+  AWSCloud9IDE:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloud9/ide/${Cloud9Instance}?region=${AWS::Region}
+  LambdaFunctionName:
+    Value: !Ref LambdaDecryptUDF
+  IAMRoleForRedshiftLambdaUDF:
+    Value: !GetAtt 'RoleRedshiftLambdaUDF.Arn'
