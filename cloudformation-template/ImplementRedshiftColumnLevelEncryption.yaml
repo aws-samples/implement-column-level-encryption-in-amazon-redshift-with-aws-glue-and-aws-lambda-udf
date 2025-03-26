@@ -13,11 +13,40 @@ Parameters:
     AllowedPattern: '([a-z])([a-z]|[0-9])*'
   RedshiftMasterUserPassword:
     Type: String
-    Description: Enter a password for the admin user account of the Redshift cluster.
+    Description: Enter a password for the admin user account of the Redshift cluster. Must be between 8 and 64 characters in length, contain at least one uppercase letter, at least one lowercase letter, and at least one number.
     ConstraintDescription: Must be between 8 and 64 characters in length, contain at least one uppercase letter, at least one lowercase letter, and at least one number.
     MinLength: 8
     MaxLength: 64
     NoEcho: true
+  DefaultGlueVersion:
+    Type: String
+    Description: Enter a value for the AWS Glue version to be used.
+    Default: '5.0'
+  DefaultGlueWorkerType:
+    Type: String
+    Description: Enter a value for the AWS Glue worker type to be used.
+    Default: 'G.1X'
+  DefaultPythonRuntimeVersion:
+    Type: String
+    Description: Enter a value for the AWS Lambda Python runtime version to be used.
+    Default: 'python3.12'
+  DefaultCloud9InstanceType:
+    Type: String
+    Description: Enter a value for the AWS Cloud9 instance type to be used.
+    Default: 't3.small'
+  DefaultCloud9ImageId:
+    Type: String
+    Description: Enter a value for the AWS Cloud9 image ID to be used.
+    Default: 'amazonlinux-2-x86_64'
+  DefaultRedshiftClusterNodeType:
+    Type: String
+    Description: Enter a value for the Amazon Redshift cluster node type to be used.
+    Default: 'dc2.large'
+  DefaultRedshiftClusterParameterGroupFamily:
+    Type: String
+    Description: Enter a value for the Amazon Redshift cluster parameter group family to be used.
+    Default: 'redshift-1.0'
+
 
 Mappings:
   SubnetConfig:
@@ -170,7 +199,7 @@ Resources:
         Ref: 'RedshiftMasterUsername'
       MasterUserPassword: 
         Ref: 'RedshiftMasterUserPassword'
-      NodeType: 'dc2.large'
+      NodeType: !Ref DefaultRedshiftClusterNodeType
       ClusterType: 'single-node'
       PubliclyAccessible: false
       Encrypted: true
@@ -187,7 +216,7 @@ Resources:
     Type: AWS::Redshift::ClusterParameterGroup
     Properties:
       Description: Cluster parameter group
-      ParameterGroupFamily: redshift-1.0
+      ParameterGroupFamily: !Ref DefaultRedshiftClusterParameterGroupFamily
       Parameters:
       - ParameterName: enable_user_activity_logging
         ParameterValue: 'true'
@@ -223,8 +252,8 @@ Resources:
   Cloud9Instance:
     Type: AWS::Cloud9::EnvironmentEC2
     Properties: 
-      ImageId: 'amazonlinux-2-x86_64'
-      InstanceType: 't3.small'
+      ImageId: !Ref DefaultCloud9ImageId
+      InstanceType: !Ref DefaultCloud9InstanceType
 
   # Lambda function
   LambdaDecryptUDF:
@@ -238,7 +267,7 @@ Resources:
       Environment:
         Variables:
           DATA_ENCRYPT_KEY: 'data-encryption-key'
-      Runtime: 'python3.12'
+      Runtime: !Ref DefaultPythonRuntimeVersion
       Timeout: 30
 
   # Glue Catalog database
@@ -308,8 +337,8 @@ Resources:
           '--InputTable': !Join ['_', !Split ['-', !Sub '${BucketDataUpload}']],
           '--SecretName': 'data-encryption-key'
         }
-      GlueVersion: '5.0'
-      WorkerType: 'G.1X'
+      GlueVersion: !Ref DefaultGlueVersion
+      WorkerType: !Ref DefaultGlueWorkerType
       NumberOfWorkers: 2
       MaxRetries: 0
       Timeout: 10
