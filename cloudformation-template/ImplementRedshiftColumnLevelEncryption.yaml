@@ -238,7 +238,7 @@ Resources:
       Environment:
         Variables:
           DATA_ENCRYPT_KEY: 'data-encryption-key'
-      Runtime: 'python3.7'
+      Runtime: 'python3.12'
       Timeout: 30
 
   # Glue Catalog database
@@ -302,13 +302,13 @@ Resources:
         ScriptLocation: !Sub s3://${BucketDataUpload}/glue-script/pii-data-encryption.py
       DefaultArguments:
         {
-          '--additional-python-modules': 'miscreant',
+          '--additional-python-modules': 'cryptography',
           '--job-bookmark-option': 'job-bookmark-disable',
           '--TempDir': !Sub 's3://${BucketDataUpload}/redshift-temp/',
           '--InputTable': !Join ['_', !Split ['-', !Sub '${BucketDataUpload}']],
           '--SecretName': 'data-encryption-key'
         }
-      GlueVersion: '3.0'
+      GlueVersion: '5.0'
       WorkerType: 'G.1X'
       NumberOfWorkers: 2
       MaxRetries: 0
