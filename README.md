@@ -22,7 +22,8 @@ This repository provides an [AWS CloudFormation](https://aws.amazon.com/cloudfor
 4.	Upload the CloudFormation template file in the [CloudFormation create stack page](https://console.aws.amazon.com/cloudformation/home#/stacks/create/template) to deploy the solution.
 5.	Enter a name for the CloudFormation stack (for example, `aws-blog-redshift-column-level-encryption`).
 6.	For **RedshiftMasterUsername**, enter a user name for the admin user account of the Amazon Redshift cluster or leave as default (`master`).
-7.	For **RedshiftMasterUserPassword**, enter a strong password for the admin user account of the Amazon Redshift cluster.
+7.	For **RedshiftMasterUserPassword**, enter a strong password for the admin user account of the Amazon Redshift cluster. 
+> Please note that the password should be between 8 and 64 characters in length, and contains at least one uppercase letter, at least one lowercase letter, and at least one number.
 
 ![alt text](/images/CloudFormationCreateStack.png)
 
@@ -94,7 +95,7 @@ CREATE TABLE pii_table(
   spoken_language VARCHAR(50),
   contact_phone_number VARCHAR(20),
   email_address VARCHAR(50),
-  registered_credit_card VARCHAR(50)
+  registered_credit_card VARCHAR(100)
 );
 ```
 
@@ -130,7 +131,7 @@ from awsglue.dynamicframe import DynamicFrame
 
 import boto3
 import base64
-from miscreant.aes.siv import SIV
+import hashlib
 from pyspark.sql.functions import udf, col
 from pyspark.sql.types import StringType
 
@@ -147,15 +148,39 @@ secret_name = args["SecretName"]
 sm_client = boto3.client('secretsmanager')
 get_secret_value_response = sm_client.get_secret_value(SecretId = secret_name)
 data_encryption_key = get_secret_value_response['SecretBinary']
-siv = SIV(data_encryption_key)  # Without nonce, the encryption becomes deterministic
+
+# Create a key using SHA-256 to ensure it's exactly 32 bytes for AES-256
+key_hash = hashlib.sha256(data_encryption_key).digest()
+
+# Broadcast the key hash so it's available to all executors
+key_hash_broadcast = sc.broadcast(key_hash)
 
 # define the data encryption function
 def pii_encrypt(value):
     if value is None:
         value = ""
-    ciphertext = siv.seal(value.encode())
-    return base64.b64encode(ciphertext).decode('utf-8')
-
+        
+    # Import the cryptography library inside the function
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    
+    # Convert to bytes if not already
+    plaintext = value.encode('utf-8')
+    
+    # Use the broadcasted key
+    key = key_hash_broadcast.value
+    aesgcm = AESGCM(key)
+    
+    # Generate a deterministic nonce based on the value
+    # Using a hash of the value ensures the same nonce for the same input
+    # Note: In production, carefully consider the security implications of this approach
+    nonce = hashlib.sha256(plaintext).digest()[:12]  # AES-GCM requires a 12-byte nonce
+    
+    # No additional authenticated data (None)
+    encrypted_bytes = aesgcm.encrypt(nonce, plaintext, None)
+    
+    # Return as base64 string
+    return base64.b64encode(nonce + encrypted_bytes).decode('utf-8')
+    
 # register the data encryption function as Spark SQL UDF   
 udf_pii_encrypt = udf(lambda z: pii_encrypt(z), StringType())
 
